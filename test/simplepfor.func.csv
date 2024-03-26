@@ -1,0 +1,10 @@
+funcname,state
+strtol,untouched
+llvm.smax.i32,untouched
+fprintf,ef
+main,untouched
+_Z18__cilkrts_getticksv,untouched
+llvm.sync.unwind,untouched
+llvm.syncregion.start,untouched
+printf,ef
+malloc,untouched

@@ -1,0 +1,9 @@
+funcname,loopname,dac_count
+fft_twiddle_16,if.end,1022
+fft_twiddle_2,if.end,8192
+unshuffle,if.end,106560
+fft_twiddle_gen,if.end,1110976
+fft_aux,pfor.cond,50016
+fft_unshuffle_2,if.end,8192
+fft_unshuffle_16,if.end,1022
+compute_w_coefficients,if.end,8192

@@ -1,0 +1,7 @@
+funcname,state
+strtol,untouched
+llvm.smax.i32,untouched
+main,untouched
+llvm.syncregion.start,untouched
+_Z13malloc2DArrayll,untouched
+malloc,both

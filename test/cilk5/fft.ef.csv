@@ -1,0 +1,5 @@
+funcname,loopname,ef_count
+fft_twiddle_16,if.end,2
+fft_aux,pfor.cond,2
+fft_unshuffle_16,if.end,2
+startup_cilk,pfor.cond,1

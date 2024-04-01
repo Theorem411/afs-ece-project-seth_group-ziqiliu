@@ -23,17 +23,21 @@ entry:
 }
 
 ; Function Attrs: mustprogress noinline uwtable
-define dso_local void @_Z14executeFuncPtrPFviEi(void (i32)* nocapture noundef readonly %func, i32 noundef %value) local_unnamed_addr #1 !callback !7 {
+define dso_local void @_Z14executeFuncPtrPvi(i8* nocapture noundef readonly %func, i32 noundef %value) local_unnamed_addr #1 {
 entry:
-  tail call void %func(i32 noundef %value)
+  %0 = bitcast i8* %func to void (i32)*
+  %add = add nsw i32 %value, 1
+  tail call void %0(i32 noundef %add)
+  %sub = add nsw i32 %value, -1
+  tail call void %0(i32 noundef %sub)
   ret void
 }
 
 ; Function Attrs: mustprogress noinline uwtable
 define dso_local noundef i32 @_Z4demov() local_unnamed_addr #1 {
 entry:
-  tail call void @_Z14executeFuncPtrPFviEi(void (i32)* noundef nonnull @_Z11myFunction1i, i32 noundef 5)
-  tail call void @_Z14executeFuncPtrPFviEi(void (i32)* noundef nonnull @_Z11myFunction2i, i32 noundef 5)
+  tail call void @_Z14executeFuncPtrPvi(i8* noundef bitcast (void (i32)* @_Z11myFunction1i to i8*), i32 noundef 5)
+  tail call void @_Z14executeFuncPtrPvi(i8* noundef bitcast (void (i32)* @_Z11myFunction2i to i8*), i32 noundef 5)
   ret i32 0
 }
 
@@ -45,10 +49,8 @@ attributes #1 = { mustprogress noinline uwtable "frame-pointer"="none" "min-lega
 
 !0 = !{i32 1, !"wchar_size", i32 4}
 !1 = !{i32 7, !"uwtable", i32 1}
-!2 = !{!"clang version 14.0.6 (/afs/ece/project/seth_group/ziqiliu/uli-opencilk-project/clang 7bd465c3ab0afbef62b430a362e3cd897fef2fd6)"}
+!2 = !{!"clang version 14.0.6 (/afs/ece/project/seth_group/ziqiliu/uli-opencilk-project/clang 6f419a6906c36c3ad3886057b4a47c78d18d9678)"}
 !3 = !{!4, !4, i64 0}
 !4 = !{!"int", !5, i64 0}
 !5 = !{!"omnipotent char", !6, i64 0}
 !6 = !{!"Simple C++ TBAA"}
-!7 = !{!8}
-!8 = !{i64 0, i64 1, i1 false}

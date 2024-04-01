@@ -5,6 +5,7 @@
 #include <fstream>
 #include <unordered_map>
 #include <utility>
+#include <cassert>
 
 // global datastructure 
 
@@ -89,27 +90,41 @@ void _rc_bump_down() {
 }
 }
 
-//=== Source Level Debug ==========================
-// func name -> loop name -> file name x line number
-std::unordered_map<
-    std::string, std::unordered_map<
-        std::string, std::pair<std::string, uint64_t>
-    >
-> LoopSource = {};
+//=== PBBsV2-specific instrumentation ==========================
+// parallel_for spec name -> runtime status count
+struct PForStats {
+    PForStats() {}
+    PForStats(std::string dbg_name) : entry_count(0), dbg_name(dbg_name) {}
+    void inc() { ++entry_count; }
+    uint64_t show_entry_count() { return entry_count; }
+    std::string show_dbg_name() { return dbg_name; }
+private: 
+    uint64_t entry_count;
+    std::string dbg_name; // contain callsite dbg metadata
+};
 
-// source level debug info tracking logic: insert next to _choice
+std::unordered_map<std::string, PForStats> PForDAC; 
+std::unordered_map<std::string, PForStats> PForEF; 
+
+// _source_debug_info: insert at entry of each parallel_for spec
 extern "C" {
 __attribute__((used))
-void _source_debug_info(const char *func_name, const char *loop_name, 
-                        const char *file_name, uint64_t ln) {
+void _source_debug_info(const char *func_name, const char *sp_name) {
     std::string FuncName(func_name);
-    std::string LoopName(loop_name);
-    std::string FileName(file_name);
-    if (LoopSource.find(FuncName) == LoopSource.end()) {
-        LoopSource[FuncName] = std::unordered_map<std::string, std::pair<std::string, uint64_t>>();
+    std::string SpName(sp_name);
+    if (rc > 0) {
+        // dac
+        if (PForDAC.find(FuncName) == PForDAC.end()) {
+            PForDAC[FuncName] = PForStats(SpName);
+        } 
+        PForDAC[FuncName].inc();
+    } else {
+        // ef 
+        if (PForEF.find(FuncName) == PForEF.end()) {
+            PForEF[FuncName] = PForStats(SpName);
+        } 
+        PForEF[FuncName].inc();
     }
-    auto &L2Src = LoopSource[FuncName];
-    L2Src[LoopName] = std::make_pair(FileName, ln);
 }
 }
 
@@ -118,34 +133,21 @@ extern "C" {
 __attribute__((used))
 __attribute__((destructor)) // will be called after main function returns
 void print() {
+    assert(rc == 0 && "rc should be 0 at the end of execution!");
     // output dac results to dac.csv
     std::ofstream dacCSV("dac.csv");
     if (!dacCSV.is_open()) {
         std::cerr << "Failed to open dac.csv" << std::endl;
         return;
     }
-    dacCSV << "funcname,loopname,file,ln,dac_count\n";
+    dacCSV << "dac_count,sp_name,pfor_name\n";
 
-    // std::cout << "printing loop to dynamic DAC count (size: " << LoopToDACCount.size() << ")...\n";
-    for (auto &it : LoopToDACCount) {
-        std::string funcname = it.first;
-        auto &L2DAC = it.second;
-        for (auto &it : L2DAC) {
-            std::string loopname = it.first;
-            uint64_t dac_count = it.second;
-
-            auto &pair = LoopSource[funcname][loopname];
-            std::string filename = pair.first;
-            uint64_t ln = pair.second;
-
-            dacCSV << funcname 
-                << "," << loopname 
-                << "," << filename
-                << "," << ln
-                << "," << dac_count 
-                << std::endl;
-        }
+    for (auto &it : PForDAC) {
+        uint64_t dac_count = it.second.show_entry_count();
+        std::string dbg_name = it.second.show_dbg_name();
+        dacCSV << dac_count << "," << dbg_name << "," << it.first << "\n"; 
     }
+
     dacCSV.close();
     std::cout << "flushed to dac.csv!" << std::endl;
 
@@ -156,30 +158,14 @@ void print() {
         return;
     }
     
-    efCSV << "funcname,loopname,file,ln,dac_count\n";
-
-    // std::cout << "printing loop to dynamic EF count (size: " << LoopToEFCount.size() << ")...\n";
-    for (auto &it : LoopToEFCount) {
-        std::string funcname = it.first;
-        auto &L2EF = it.second;
-        for (auto &it : L2EF) {
-            std::string loopname = it.first;
-            uint64_t ef_count = it.second;
-
-            auto &pair = LoopSource[funcname][loopname];
-            std::string filename = pair.first;
-            uint64_t ln = pair.second;
-
-            efCSV << funcname 
-                << "," << loopname 
-                << "," << filename
-                << "," << ln
-                << "," << ef_count 
-                << std::endl;
-        }
+    efCSV << "ef_count,sp_name,pfor_name\n";
+    for (auto &it : PForEF) {
+        uint64_t ef_count = it.second.show_entry_count();
+        std::string dbg_name = it.second.show_dbg_name();
+        efCSV << ef_count << "," << dbg_name << "," << it.first << "\n";
     }
-    efCSV.close();
 
+    efCSV.close(); 
     std::cout << "flushed to ef.csv!" << std::endl;
 }
 }

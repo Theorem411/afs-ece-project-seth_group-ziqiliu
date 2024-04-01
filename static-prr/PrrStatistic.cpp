@@ -409,10 +409,10 @@ PassPluginLibraryInfo getParallelRegionStatsPluginInfo() {
         );
 
         // register for clang's -fpass-plugin=prr-stats
-        // PB.registerTapirLateEPCallback([&](ModulePassManager &MPM, auto) {
-        //     MPM.addPass(ParallelRegionStats());
-        //     return true;
-        // });
+        PB.registerTapirLateEPCallback([&](ModulePassManager &MPM, auto) {
+            MPM.addPass(ParallelRegionStats());
+            return true;
+        });
     };
 
     return {LLVM_PLUGIN_API_VERSION, PRR_NAME, "0.0.1", callback};

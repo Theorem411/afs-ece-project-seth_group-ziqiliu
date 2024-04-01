@@ -25,6 +25,7 @@
 #include "llvm/IR/Type.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Constant.h"
+#include "llvm/IR/CFG.h"
 #include "llvm/Analysis/TapirTaskInfo.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/LoopIterator.h"
@@ -46,7 +47,7 @@ namespace {
 struct InstrumentTestImpl {
     InstrumentTestImpl(Function &F, DominatorTree &DT, LoopInfo &LI, TaskInfo &TI) 
         : F(F), DT(DT), LI(LI), TI(TI) {}
-
+    bool runOnFunction(FunctionCallee &SOURCE_DEBUG_INFO);
     bool runOnLoop(Loop *L, Value *FuncNameChar, FunctionCallee &CHOICE);
     bool runOnTask(Task *T, FunctionCallee &RC_BUMP_UP, FunctionCallee &RC_BUMP_DOWN);
     bool run();
@@ -67,12 +68,14 @@ private:
         }
     }
 
-    void collectTaskExits(Task *T, SmallVector<BasicBlock *> &TaskExits) {
+    void collectTaskExits(Task *T, SmallSet<BasicBlock *, 4> &TaskExits) {
         assert(T && "collectTaskExit encounter null Task!");
         for (Spindle *S : T->getSpindles()) {
             for (BasicBlock* B : S->blocks()) {
                 if (T->isTaskExiting(B)) {
-                    TaskExits.push_back(B);
+                    for (auto S = succ_begin(B); S != succ_end(B); ++S) {
+                        TaskExits.insert(*S);
+                    }
                 }
             }
         }
@@ -113,7 +116,7 @@ bool InstrumentTestImpl::runOnLoop(Loop *L, Value *FuncNameChar, FunctionCallee 
 
     // insert call to _choice at header
     BasicBlock *H = L->getHeader();
-    // IRBuilder<> Builder(PH->getFirstNonPHI());
+    // IRBuilder<> Builder(PH->getFirstNonPHIOrDbgOrLifetime());
     IRBuilder<> Builder(PH->getTerminator());
 
     GlobalVariable *LoopName = Builder.CreateGlobalString(
@@ -135,47 +138,40 @@ bool InstrumentTestImpl::runOnLoop(Loop *L, Value *FuncNameChar, FunctionCallee 
     // ArrayRef<Value *> Args({FuncNameChar, LoopNameChar});
     Builder.CreateCall(CHOICE, {FuncNameChar, LoopNameChar});
 
-    // insert call to SOURCE_DEBUG_INFO
-    auto &LocRange = L->getLocRange();
-    assert(LocRange && "Loop has no LocRange, make sure you clang with -g!");
-    const auto &DLStart = LocRange.getStart();
-    assert(DLStart);
-
-
-    Builder.CreateCall(SOURCE_DEBUG_INFO, {FuncNameChar, LoopNameChar, });
-
     // DEBUG: don't uncomment the following code!
     // call->setCallingConv(llvm::CallingConv::C);
     return true;
 }
 
 bool InstrumentTestImpl::runOnTask(Task *T, FunctionCallee &RC_BUMP_UP, FunctionCallee &RC_BUMP_DOWN) {
-    assert(T && T->getDetach() && "runOnTask shouldn't be called on root task");
-
+    if (!T->getDetach()) {
+        // skip root task
+        return false;
+    }
     // at the start of each task entry, bump up globvar RC
     BasicBlock *TaskEntry = T->getEntry();
     if (!TaskEntry) {
         LLVM_DEBUG(dbgs() << "\n<><><> Found Task without entry! <><><>\n");
         return false;
     }
-
     LLVM_DEBUG(dbgs() << "  -- instrument task entry...\n");
-    IRBuilder<> Builder(TaskEntry->getFirstNonPHI());
+    IRBuilder<> Builder(T->getDetach()); // TaskEntry->getFirstNonPHIOrDbgOrLifetime()
 
     // ===== Create RC_BUMP_UP ====================
     CallInst *call = Builder.CreateCall(RC_BUMP_UP);
-
 
     // DEBUG: don't uncomment the following line 
     // call->setCallingConv(llvm::CallingConv::C);
 
     // before exit of task region, bump down globvar RC
     LLVM_DEBUG(dbgs() << "  -- instrument task exits...\n");
-    SmallVector<BasicBlock *> TaskExits;
+    SmallSet<BasicBlock *, 4> TaskExits;
     collectTaskExits(T, TaskExits);
     for (BasicBlock *E : TaskExits) {
+
+
         LLVM_DEBUG(dbgs() << "     on task exit block " << E->getName() << ":\n");
-        IRBuilder<> Builder(E->getTerminator());
+        IRBuilder<> Builder(E->getFirstNonPHIOrDbgOrLifetime());
         // =============== Crate RC_BUMP_DOWN ============
         CallInst *call = Builder.CreateCall(RC_BUMP_DOWN);
 
@@ -183,8 +179,54 @@ bool InstrumentTestImpl::runOnTask(Task *T, FunctionCallee &RC_BUMP_UP, Function
         // DEBUG: don't uncomment the following line!
         // call->setCallingConv(llvm::CallingConv::C);
     }
+
     return true;
 }
+
+bool InstrumentTestImpl::runOnFunction(FunctionCallee &SOURCE_DEBUG_INFO) {
+    // check !DISubprogram for hint of parallel_for 
+    DISubprogram *SP = F.getSubprogram();
+    if (!SP) {
+        errs() << F.getName() << " make sure compiled with -gdwarf-2!\n";
+        return false;
+    }
+    StringRef spname = SP->getName();
+    if(!spname.startswith(StringRef("parallel_for<(lambda at "))) 
+        return false;
+    
+    
+    BasicBlock &Entry = F.getEntryBlock();
+    IRBuilder<> Builder(Entry.getTerminator());
+    // two input as global strings
+    GlobalVariable *SPName = Builder.CreateGlobalString(
+        spname,
+        "spname",
+        0 /* Default AddressSpace */, 
+        nullptr /* Default Module */
+    );
+    GlobalVariable *FuncName = Builder.CreateGlobalString(
+        F.getName(),
+        "funcname",
+        0 /* Default AddressSpace */, 
+        nullptr /* Default Module */
+    );
+    // prepare arguments 
+    LLVMContext &Ctx = F.getParent()->getContext();
+    Value *idx_zero = ConstantInt::get(Type::getInt64Ty(Ctx), 0);
+    Value *SPNameChar = Builder.CreateInBoundsGEP(
+        /*Ty*/SPName->getValueType(),
+        /*Ptr*/SPName,
+        /*IdxList*/{idx_zero, idx_zero}
+    );
+    Value *FuncNameChar = Builder.CreateInBoundsGEP(
+        /*Ty*/FuncName->getValueType(),
+        /*Ptr*/FuncName,
+        /*IdxList*/{idx_zero, idx_zero}
+    );
+    Builder.CreateCall(SOURCE_DEBUG_INFO, {FuncNameChar, SPNameChar});
+
+    return true;
+}   
 
 bool InstrumentTestImpl::run() {
     LLVM_DEBUG(dbgs() << "\nrunOnFunction(" << F.getName() << ")...\n");
@@ -256,7 +298,7 @@ bool InstrumentTestImpl::run() {
         "_source_debug_info",
         FunctionType::get(
             /*Result*/Type::getVoidTy(Ctx),
-            /*Params*/ArrayRef<Type *>({I8PtrTy, I8PtrTy, I8PtrTy, I64Ty})
+            /*Params*/ArrayRef<Type *>({I8PtrTy, I8PtrTy}),
             /*isVarArg*/false
         )
     );
@@ -265,13 +307,11 @@ bool InstrumentTestImpl::run() {
     bool Changed = false;
     LLVM_DEBUG(dbgs() << "add instrumentation to all task...\n");
     for (Task *T : TI) {
-        if (T->getDetach()) {
-            // for non-root task only
-            LLVM_DEBUG(dbgs() << "  runOnTask started with:\n");
-            // T->getDetach()->dump();
+        // for non-root task only
+        LLVM_DEBUG(dbgs() << "  runOnTask started with:\n");
+        // T->getDetach()->dump();
 
-            Changed |= runOnTask(T, RC_BUMP_UP, RC_BUMP_DOWN);
-        }
+        Changed |= runOnTask(T, RC_BUMP_UP, RC_BUMP_DOWN);
     }
 
     // for each tapir loop, instrument with _choice split 
@@ -282,8 +322,11 @@ bool InstrumentTestImpl::run() {
     while (!workList.empty()) {
         Loop *L = workList.pop_back_val();
         LLVM_DEBUG(dbgs() << "  runOnLoop:" << L->getLoopPreheader()->getName() << "\n");
-        Changed |= runOnLoop(L, FuncNameChar, CHOICE);
+        Changed |= runOnLoop(L, FuncNameChar, CHOICE); 
     }
+
+    // instrument all parallel_for spec func entry
+    Changed |= runOnFunction(SOURCE_DEBUG_INFO);
     return Changed;
 }
 

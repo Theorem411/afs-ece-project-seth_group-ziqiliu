@@ -35,69 +35,23 @@ cl::opt<std::string> TestName(
 
 namespace {
 //========= global utitlity functions ========================
-// Parallel_for name parsing "parallel_for<(lambda at ...": modify filename, ln, col
-bool parseParallelForSPName(StringRef PForName, std::string &filename, uint64_t &ln, uint64_t &col) {
-    // pre-screen
-    StringRef ParallelForNamePrefix("parallel_for<(lambda at ");
-    if(!PForName.startswith(ParallelForNamePrefix)) 
-        return false;
-    outs() << "found parallel_for<(lambda at)!\n";
-    // first section: looking for <filename>.C
-    auto pair = PForName.split(':');
-    StringRef substr = pair.first;
-    StringRef filenameStr = substr.split(ParallelForNamePrefix).second;
-    if (filenameStr.empty()) 
-        return false;
 
-    StringRef rest = pair.second;
-    if (rest.empty())
-        return false;
-    
-    // second section: looking for <line_number>
-    pair = rest.split(':');
-    StringRef lnStr = pair.first;
-    
-
-    rest = pair.second;
-    if (rest.empty()) 
-        return false;
-
-    // third section: looking for <col number>
-    pair = rest.split(")>");
-    StringRef colStr = pair.first;
-
-    // return result by modifying reference
-    if (!lnStr.getAsInteger(/*radix:autosensing*/0, ln)) {
-        return false;
-    }
-    if (!colStr.getAsInteger(/*radix:autosensing*/0, col)) {
-        return false;
-    }
-    filename = filenameStr.str();
-
-    return true;
-}
 
 //======== each instance should represents a specification of template function parallel_for defined in opencilk.h
 struct ParallelFor {
-    ParallelFor(Function &F, DISubprogram &SP, PRState prs, StringRef filename, uint64_t ln, uint64_t col) 
-        : F(F), SP(SP), prs(prs), filename(filename), ln(ln), col(col) {}
+    ParallelFor(
+        Function &F, PRState prs, StringRef spname, StringRef tempfile) 
+    : F(F), prs(prs), spname(spname), tempfile(tempfile) {}
 
     // parent function query
     Function &getFunction() const { return F; }
     StringRef getFuncName() const { return F.getName(); }
 
     // template file query
-    StringRef getTemplateFile() const { 
-        std::string FileName = (SP.getFile())->getFilename().str();
-        std::string DirName = SP.getDirectory().str();
-        return StringRef(DirName + '/' + FileName); 
-    }
+    StringRef getTemplateFile() const { return tempfile; }
 
-    // source file / callsite query
-    StringRef getSourceFile() const { return filename; }
-    uint64_t getLine() const { return ln; }
-    uint64_t getCol() const { return col; }
+    // DISubprogram name 
+    StringRef getSpName() const { return spname; }
 
     // parallel_for spec function PRState query
     PRState getPRS() const { return prs; }
@@ -106,38 +60,29 @@ struct ParallelFor {
 private:
     Function &F;        // parallel_for specification as llvm function IR
     PRState prs;        // prstate
-    DISubprogram &SP;   // DISubprogram metadata: contains template file info
-    StringRef filename; // source file name 
-    uint64_t ln;        // source file/callsite line number
-    uint64_t col;       // source file/callsite col number
+    StringRef spname;   // DISubprogram name field (key)
+    StringRef tempfile; // template file name
 };
 
 //============ CSV output helper class =====================================
 struct CsvRow {
-    CsvRow(StringRef Func, StringRef SrcFile, StringRef TempFile, StringRef ln, StringRef col, StringRef prs) : 
-        Func(Func), SrcFile(SrcFile), TempFile(TempFile), ln(ln), col(col), prs(prs) {}
+    CsvRow(Function &Func, PRState prs, StringRef SpName, StringRef TempFile) : 
+        Func(Func), prs(prs), SpName(SpName), TempFile(TempFile) {}
     // CsvRow(std::string FuncName, std::string FileName, std::string DirName, std::string ln, std::string prs) 
     //     : FuncName(FuncName), FileName(FileName), DirName(DirName), ln(ln), prs(prs) {}
 
     // emit a row of csv output
-    StringRef emit() const {
-        StringRef s(
-            ln.str() + "," 
-            + col.str() + "," 
-            + prs.str() + "," 
-            + SrcFile.str() + "," 
+    std::string emit() const {
+        return printPRState(prs).str() + "," 
+            + SpName.str() + ","
             + TempFile.str() + "," 
-            + Func.str() + "\n"
-        );
-        return s;
+            + Func.getName().str() + "\n";
     }
 private: 
-    StringRef Func;
-    StringRef SrcFile;
+    Function &Func;
+    PRState prs;
+    StringRef SpName;
     StringRef TempFile;
-    StringRef ln;
-    StringRef col;
-    StringRef prs;
 };
 
 struct CSV {
@@ -147,8 +92,8 @@ public:
     void add(CsvRow &row) {
         rows.push_back(row);
     }
-    StringRef emitHeader() const {
-        return StringRef("ln,col,prs,file,temp_file,pfor\n");
+    std::string emitHeader() const {
+        return "prs,sp_name,temp_file,pfor\n";
     }
 public: 
     SmallVector<CsvRow, 8> rows;
@@ -164,17 +109,10 @@ struct ParallelForDebugInfoImpl {
         ParallelForMap.clear();
     }
     void run();
-private: 
-    // parallel_for specification identifier
-    bool isParallelForSpecfication(Function &F) const {
-        DISubprogram *SP = F.getSubprogram();
-        if (!SP)
-            return false;
-        // identify parallel for spec from DISubprogram using parseParallelForSPName 
-        std::string fn; // init by parseParallelForSPName
-        uint64_t ln, col; // init by parseParallelForSPName
-        return parseParallelForSPName(SP->getName(), fn, ln, col);
-    }
+private:
+    // Parallel_for name parsing "parallel_for<(lambda at ...": modify filename, ln, col
+    ParallelFor *getParallelForMetadata(Function &F, DISubprogram *SP);
+
     // I/O utility
     void flushCSV() const;
 private:  
@@ -186,6 +124,22 @@ private:
     CSV csv;
 };
 
+ParallelFor *ParallelForDebugInfoImpl::getParallelForMetadata(Function &F, DISubprogram *SP) {
+    // mdnode field: name
+    StringRef spname = SP->getName();
+
+    if(!spname.startswith(StringRef("parallel_for<(lambda at "))) 
+        return nullptr;
+    // mdnode field: file (template file)
+    DIFile *DIF = SP->getFile();
+    assert(DIF && "DIF empty!");
+    StringRef tempfile = DIF->getFilename();
+    // errs() << F.getName() << "\n" << "  " << tempfile << "\n";
+    
+    ParallelFor *pfor = new ParallelFor(F, PR[&F], spname, tempfile); 
+    return pfor;
+}
+
 void ParallelForDebugInfoImpl::run() {
     //=== Find all parallel_for specification declaration ===========
     for (Function &F : M) {
@@ -196,26 +150,17 @@ void ParallelForDebugInfoImpl::run() {
         if (!SP)
             continue;
 
-        std::string fn; // init by parseParallelForSPName
-        uint64_t ln, col; // init by parseParallelForSPName
-        if (parseParallelForSPName(SP->getName(), fn, ln, col)) {
+        if (ParallelFor *PFor = getParallelForMetadata(F, SP)) {
             // found parallel_for!
 
             // get parallel_for spec function prstate
             PRState prs = PR[&F];
 
-            // construct ParallelFor
-            ParallelFor *PFor = new ParallelFor(F, *SP, prs, StringRef(fn), ln, col);
-
             // record PFor
             ParallelForMap[&F] = PFor;
 
             // // append parallel for info to csv
-            CsvRow csvr(
-                PFor->getFuncName(), PFor->getSourceFile(), PFor->getTemplateFile(), 
-                StringRef(std::to_string(PFor->getLine())), StringRef(std::to_string(PFor->getCol())), 
-                PFor->getPRSName()
-            );
+            CsvRow csvr(PFor->getFunction(), PFor->getPRS(), PFor->getSpName(), PFor->getTemplateFile());
             csv.add(csvr);
         }
     }
@@ -241,7 +186,8 @@ void ParallelForDebugInfoImpl::run() {
             BasicBlock *B = I->getParent();
             PRState prs = PR[B];
             if (prs != PFor->getPRS()) {
-                errs() << "parallel_for spec has inconsistent prs: " << PFor->getFuncName() << "\n";
+                // errs() << "parallel_for spec has inconsistent prs: " << PFor->getFuncName(); 
+                // errs() << "\n  Block: " << printPRState(prs) << "   Func: " << printPRState(PFor->getPRS()) << "\n";
             }
         }
     }
@@ -262,10 +208,10 @@ void ParallelForDebugInfoImpl::flushCSV() const {
     }
 
     // header
-    fd << csv.emitHeader();
+    fd << StringRef(csv.emitHeader());
     // rows
     for (auto &row : csv.rows) {
-        fd << row.emit();
+        fd << StringRef(row.emit());
     }
 }
 

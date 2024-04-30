@@ -47,7 +47,7 @@ namespace {
 struct InstrumentTestImpl {
     InstrumentTestImpl(Function &F, DominatorTree &DT, LoopInfo &LI, TaskInfo &TI) 
         : F(F), DT(DT), LI(LI), TI(TI) {}
-    bool runOnFunction(FunctionCallee &SOURCE_DEBUG_INFO);
+    bool runOnFunction(FunctionCallee &SOURCE_DEBUG_INFO, FunctionCallee &CALLER_PRSTATE);
     bool runOnLoop(Loop *L, Value *FuncNameChar, FunctionCallee &CHOICE);
     bool runOnTask(Task *T, FunctionCallee &RC_BUMP_UP, FunctionCallee &RC_BUMP_DOWN);
     bool run();
@@ -68,13 +68,21 @@ private:
         }
     }
 
-    void collectTaskExits(Task *T, SmallSet<BasicBlock *, 4> &TaskExits) {
+    void collectTaskExits(Task *T, SmallVector<BasicBlock *, 4> &TaskExitEdges) {
         assert(T && "collectTaskExit encounter null Task!");
         for (Spindle *S : T->getSpindles()) {
             for (BasicBlock* B : S->blocks()) {
                 if (T->isTaskExiting(B)) {
-                    for (auto S = succ_begin(B); S != succ_end(B); ++S) {
-                        TaskExits.insert(*S);
+
+                    // if (dyn_cast<InvokeInst>(B->getTerminator()) 
+                    //     || dyn_cast<MultiRetCallInst>(B->getTerminator())) {
+                    //     // ignore unwind & multiret pad exit
+                    //     continue;
+                    // }
+                        
+                    for (auto Succ = succ_begin(B); Succ != succ_end(B); ++Succ) {
+                        BasicBlock *BNew = SplitEdge(B, *Succ);
+                        TaskExitEdges.push_back(BNew);
                     }
                 }
             }
@@ -165,9 +173,9 @@ bool InstrumentTestImpl::runOnTask(Task *T, FunctionCallee &RC_BUMP_UP, Function
 
     // before exit of task region, bump down globvar RC
     LLVM_DEBUG(dbgs() << "  -- instrument task exits...\n");
-    SmallSet<BasicBlock *, 4> TaskExits;
-    collectTaskExits(T, TaskExits);
-    for (BasicBlock *E : TaskExits) {
+    SmallVector<BasicBlock *, 4> TaskExitEdges;
+    collectTaskExits(T, TaskExitEdges);
+    for (BasicBlock *E : TaskExitEdges) {
 
 
         LLVM_DEBUG(dbgs() << "     on task exit block " << E->getName() << ":\n");
@@ -183,20 +191,95 @@ bool InstrumentTestImpl::runOnTask(Task *T, FunctionCallee &RC_BUMP_UP, Function
     return true;
 }
 
-bool InstrumentTestImpl::runOnFunction(FunctionCallee &SOURCE_DEBUG_INFO) {
+bool InstrumentTestImpl::runOnFunction(FunctionCallee &SOURCE_DEBUG_INFO, FunctionCallee &CALLER_PRSTATE) {
+    /// DEBUG: 
+    // if (F.getName() == "_ZN8oct_treeI6vertexI7point2dIdEEE15build_recursiveEN6parlay5sliceIPSt4pairImPS3_ESA_EEi") {
+    //     F.dump();
+    // }
+    /////////
+    
+    LLVMContext &Ctx = F.getParent()->getContext();
+    Value *idx_zero = ConstantInt::get(Type::getInt64Ty(Ctx), 0);
+
+    bool Changed = false;
+    IRBuilder<> Builder(Ctx);
+    /*** insert CALLER_PRSTATE at parallel_for callsite inside func body *****/
+    for (auto It = inst_begin(F); It != inst_end(F); ++It) {
+        Instruction *I = &*It;
+        if (isa<DbgInfoIntrinsic>(I)) {
+            continue; // skip debug intrinsic
+        }
+
+        Function *Callee = nullptr;
+        if (dyn_cast<CallInst>(I)) {
+            Callee = dyn_cast<CallInst>(I)->getCalledFunction();
+        } else if (dyn_cast<InvokeInst>(I)) {
+            Callee = dyn_cast<InvokeInst>(I)->getCalledFunction();
+        }
+        if (!Callee)  // not callinst or invokeinst
+            continue;
+
+        DISubprogram *SP = Callee->getSubprogram();
+        if (!SP) 
+            continue;
+        StringRef spname = SP->getName();
+        // if(!spname.startswith(StringRef("parallel_for<(lambda at "))) 
+        //     continue;
+        StringRef linkagename = SP->getLinkageName();
+        // insert call to CALLER_PRSTATE before function callsite
+        Builder.SetInsertPoint(I);
+        GlobalVariable *SPName = Builder.CreateGlobalString(
+            spname,
+            "spname",
+            0 /* Default AddressSpace */, 
+            nullptr /* Default Module */
+        );
+        GlobalVariable *PforName = Builder.CreateGlobalString(
+            linkagename,
+            "funcname",
+            0 /* Default AddressSpace */, 
+            nullptr /* Default Module */
+        );
+        GlobalVariable *CallerName = Builder.CreateGlobalString(
+            F.getName(),
+            "callername",
+            0 /* Default AddressSpace */, 
+            nullptr /* Default Module */
+        );
+        Value *SPNameChar = Builder.CreateInBoundsGEP(
+            /*Ty*/SPName->getValueType(),
+            /*Ptr*/SPName,
+            /*IdxList*/{idx_zero, idx_zero}
+        );
+        Value *PforNameChar = Builder.CreateInBoundsGEP(
+            /*Ty*/PforName->getValueType(),
+            /*Ptr*/PforName,
+            /*IdxList*/{idx_zero, idx_zero}
+        );
+        Value *CallerNameChar = Builder.CreateInBoundsGEP(
+            /*Ty*/CallerName->getValueType(),
+            /*Ptr*/CallerName,
+            /*IdxList*/{idx_zero, idx_zero}
+        );
+        Builder.CreateCall(CALLER_PRSTATE, {PforNameChar, SPNameChar, CallerNameChar});
+        Changed |= true;
+    } 
+
+    /*** insert SOURCE_DEBUG_INFO at entry *********************************/
     // check !DISubprogram for hint of parallel_for 
     DISubprogram *SP = F.getSubprogram();
     if (!SP) {
         errs() << F.getName() << " make sure compiled with -gdwarf-2!\n";
-        return false;
+        return Changed;
     }
     StringRef spname = SP->getName();
-    if(!spname.startswith(StringRef("parallel_for<(lambda at "))) 
-        return false;
-    
-    
+
+    /// CHANGE: instrument _source_debug_info for every function, not just parallel_for
+    // if(!spname.startswith(StringRef("parallel_for<(lambda at "))) 
+    //     return Changed;
+
     BasicBlock &Entry = F.getEntryBlock();
-    IRBuilder<> Builder(Entry.getTerminator());
+    Builder.SetInsertPoint(Entry.getTerminator());
     // two input as global strings
     GlobalVariable *SPName = Builder.CreateGlobalString(
         spname,
@@ -211,8 +294,6 @@ bool InstrumentTestImpl::runOnFunction(FunctionCallee &SOURCE_DEBUG_INFO) {
         nullptr /* Default Module */
     );
     // prepare arguments 
-    LLVMContext &Ctx = F.getParent()->getContext();
-    Value *idx_zero = ConstantInt::get(Type::getInt64Ty(Ctx), 0);
     Value *SPNameChar = Builder.CreateInBoundsGEP(
         /*Ty*/SPName->getValueType(),
         /*Ptr*/SPName,
@@ -224,8 +305,9 @@ bool InstrumentTestImpl::runOnFunction(FunctionCallee &SOURCE_DEBUG_INFO) {
         /*IdxList*/{idx_zero, idx_zero}
     );
     Builder.CreateCall(SOURCE_DEBUG_INFO, {FuncNameChar, SPNameChar});
+    Changed |= true;
 
-    return true;
+    return Changed;
 }   
 
 bool InstrumentTestImpl::run() {
@@ -302,6 +384,15 @@ bool InstrumentTestImpl::run() {
             /*isVarArg*/false
         )
     );
+
+    FunctionCallee CALLER_PRSTATE = M->getOrInsertFunction(
+        "_caller_prstate",
+        FunctionType::get(
+            /*Result*/Type::getVoidTy(Ctx),
+            /*Params*/ArrayRef<Type *>({I8PtrTy, I8PtrTy, I8PtrTy}),
+            /*isVarArg*/false
+        )
+    );
     
     // run through all task, instrument with region-count updates
     bool Changed = false;
@@ -325,8 +416,8 @@ bool InstrumentTestImpl::run() {
         Changed |= runOnLoop(L, FuncNameChar, CHOICE); 
     }
 
-    // instrument all parallel_for spec func entry
-    Changed |= runOnFunction(SOURCE_DEBUG_INFO);
+    // instrument all parallel_for spec func entry && callsites of any parallel_for in func body
+    Changed |= runOnFunction(SOURCE_DEBUG_INFO, CALLER_PRSTATE);
     return Changed;
 }
 
@@ -415,12 +506,89 @@ struct InstrumentTestPass : public PassInfoMixin<InstrumentTestPass>{
             Changed |= InstrumentTestImpl(*F, DT, LI, TI).run();
         }
         
-        if (Changed)
+        if (Changed) {
+            outs() << "statically instrumented !\n";
             return PreservedAnalyses::none();
+        }
         return PreservedAnalyses::all();
     }
 };
 
+/**** pass history printer ***********
+* source: https://medium.com/@mshockwave/writing-pass-instrument-for-llvm-newpm-f17c57d3369f
+*/
+struct PassHistoryPrinter {
+    PassHistoryPrinter() : Stopped(false) {}
+
+    void registerCallbacks(PassInstrumentationCallbacks &PIC) {
+        using namespace std::placeholders;
+        // PIC.registerBeforeSkippedPassCallback(
+        //     std::bind(&PassHistoryPrinter::beforePass, this, _1, _2));
+        PIC.registerBeforeNonSkippedPassCallback(
+            std::bind(&PassHistoryPrinter::beforePass, this, _1, _2));
+
+        PIC.registerAfterPassCallback(
+            std::bind(&PassHistoryPrinter::afterPass, this, _1, _2));
+    }
+
+private:
+    bool Stopped;
+
+    void beforePass(StringRef PassID, Any IR) {
+        StringRef PassKind;
+        const Function *F = nullptr;
+        if (any_isa<const Function*>(IR)) {
+            PassKind = "FunctionPass";
+            F = any_cast<const Function*>(IR);
+        }
+        if (any_isa<const Module *>(IR)) {
+            PassKind = "ModulePass";
+        }
+
+        if (!Stopped) {
+            // outs() << "ran " << PassKind << " " << PassID;
+            // if (F) {
+            //     outs() << " @func " << F->getName();
+            // }
+            // outs() << '\n';
+            if (F && F->getName() == "_ZN8oct_treeI6vertexI7point2dIdEEE15build_recursiveEN6parlay5sliceIPSt4pairImPS3_ESA_EEi") {
+                outs() << "ran " << PassKind << " " << PassID;
+                outs() << " @func " << F->getName() << '\n';
+                // outs() << StringRef(printCallInstInOrder(F)) << '\n';
+                F->print(outs());
+                outs() << '\n';
+            }
+        }
+    }
+
+    void afterPass(StringRef PassID, Any IR) {
+        // StringRef PassToStop = "{anonymous}::InstrumentTestPass";
+        StringRef PassToStop = "";
+        if (PassID == PassToStop) {
+            Stopped = true;
+        }
+    }
+
+    std::string printCallInstInOrder(const Function *F) {
+        std::string printout;
+        raw_string_ostream os(printout);
+        for (auto It = inst_begin(F), IE = inst_end(F); It != IE; ++It) {
+            const Instruction *I = &*I;
+            const Instruction *CI = nullptr;
+            if (isa<CallInst>(I)) {
+                CI = dyn_cast<CallInst>(I);
+            } else if (isa<InvokeInst>(I)) {
+                CI = dyn_cast<InvokeInst>(I);
+            }
+            if (!CI) 
+                continue;
+            os << "\t";
+            CI->print(os);
+            os << "\n";
+        }
+        return printout;
+    }
+};
 
 } // end namespace
 
@@ -438,12 +606,34 @@ static RegisterPass<InstrumentTestPassLegacy> X(
 // }
 
 // registered as dynamic pass plugin using new pass manager
+static PassHistoryPrinter PassHistoryPrinterObj;
+
 PassPluginLibraryInfo getPassPluginInfo() {
     const auto callback = [](PassBuilder &PB) {
         PB.registerTapirLateEPCallback([&](ModulePassManager &MPM, auto) {
             MPM.addPass(InstrumentTestPass());
             return true;
         });
+
+        auto &PIC = *PB.getPassInstrumentationCallbacks();
+        PassHistoryPrinterObj.registerCallbacks(PIC);
+        // PIC.registerBeforeNonSkippedPassCallback([&](StringRef PassID, Any IR) {
+        //     outs() << "non-skipped\t" << PassID;
+        //     StringRef PassKind;
+        //     StringRef FuncName;
+        //     if (const Function *F = any_cast<const Function *>(IR)) {
+        //         PassKind = "FunctionPass";
+        //         FuncName = F->getName();
+        //     }
+        //     if (any_isa<const Module *>(IR)) {
+        //         PassKind = "ModulePass";
+        //     }
+        //     outs() << '\t' << PassKind;
+        //     if (FuncName.size()) {
+        //         outs() << "\t@func " << FunName;
+        //     }
+        //     outs() << '\n';
+        // });
     };
 
     return {LLVM_PLUGIN_API_VERSION, INSTR_NAME, "0.0.1", callback};
@@ -452,4 +642,5 @@ PassPluginLibraryInfo getPassPluginInfo() {
 extern "C" LLVM_ATTRIBUTE_WEAK PassPluginLibraryInfo llvmGetPassPluginInfo() {
     return getPassPluginInfo();
 }
+
 

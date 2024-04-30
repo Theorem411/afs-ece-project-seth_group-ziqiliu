@@ -1,18 +1,17 @@
 #include <vector>
 #include <iostream>
 #include "parlay/primitives.h"
-#include "parlay/random.h"
-#include "common/geometry.h"
-#include "common/get_time.h"
-#include "common/topology.h"
-#include "common/atomics.h"
+#include "parlay/internal/scheduler_plugins/opencilk.h"
+// #include "common/parseCommandLine.h"
 
-using parlay::parallel_for;
+using namespace std;
+
+// using parlay::parallel_for;
 
 int main() {
     vector<int> nums(100, 0);
 
-    parallel_for(0, 100, [&](size_t i) {
+    parlay::parallel_for(0, 100, [&](size_t i) {
         ++nums[i];
     });
     

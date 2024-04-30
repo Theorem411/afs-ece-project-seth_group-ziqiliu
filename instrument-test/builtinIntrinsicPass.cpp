@@ -64,10 +64,21 @@ bool BuiltInInstrumentImpl::run(Function &F) {
     Type *I8Ptr = PointerType::get(Type::getInt8Ty(ctx), 0);
     FunctionType *FnTy = FunctionType::get(
         /*Result*/Type::getVoidTy(ctx),
-        /*Params*/{I8Ptr, I64, I64, I32},
+        /*Params*/{I8Ptr, I8Ptr, I64, I64, I32},
         /*isVarArg*/false
     );
     PointerType *FnPtrTy = PointerType::get(FnTy, 0);
+
+    Value *idx_zero = ConstantInt::get(Type::getInt64Ty(ctx), 0);
+
+    // file and line number using DISubprogram of parent function F
+    DISubprogram *Subprogram = F.getSubprogram();
+    if (!Subprogram) {
+        errs() << F.getName() << " has no DISubprogram!\n";
+        return false;
+    }
+    StringRef subpNameStr = Subprogram->getName();
+    StringRef subpLinkageNameStr = Subprogram->getLinkageName();
 
     // collect list of __builtin_uli_lazyd_inst intrinsic for replacement
     SmallVector<Instruction *, 8> Builtin_Uli_Lazyd_Insts;
@@ -77,7 +88,7 @@ bool BuiltInInstrumentImpl::run(Function &F) {
             && (Intrinsic->getIntrinsicID() == Intrinsic::uli_lazyd_inst)) 
         {
             // Found Intrinsic "__builtin_uli_lazyd_inst" callsite
-            outs() << "found __builtin_uli_lazyd_inst callsite in " << F.getName() << '\n';
+            // outs() << "found __builtin_uli_lazyd_inst callsite in " << F.getName() << '\n';
             builder.SetInsertPoint(&*I);
             // Extract lazydIntrumentLoop function
             // %0 = bitcast i8* %fnptr to void (i8*, i64, i64, i32)*
@@ -88,41 +99,70 @@ bool BuiltInInstrumentImpl::run(Function &F) {
                 /*DestTy*/FnPtrTy,
                 /*Twine:Name*/"instloop"
             );
-            outs() << "  bitcast np!\n";
-            // call void %0(i8* file_and_line_number, i64 trip_count, i64 grain_size, i32 depth)
-            Value *FileAndLineNumber = CI->getArgOperand(1);
+            // outs() << "  bitcast np!\n";
+            // first operand __builtin_uli_lazyd_inst is placeholder
+            // Value *FileAndLineNumber = CI->getArgOperand(1); // value: nullptr
+            
+            GlobalVariable *LinkageNameGlobStr = builder.CreateGlobalString(
+                subpLinkageNameStr, 
+                "file_and_line_number", 
+                0 /* Default AddressSpace */, 
+                nullptr /* Default Module */
+            );
+
+            Value *LinkageName = builder.CreateInBoundsGEP(
+                /*Ty*/LinkageNameGlobStr->getValueType(),
+                /*Ptr*/LinkageNameGlobStr,
+                /*IdxList*/{idx_zero, idx_zero}
+            );
+
+            GlobalVariable *FileAndLineGlobStr = builder.CreateGlobalString(
+                subpNameStr, 
+                "file_and_line_number", 
+                0 /* Default AddressSpace */, 
+                nullptr /* Default Module */
+            );
+
+            Value *FileAndLine = builder.CreateInBoundsGEP(
+                /*Ty*/FileAndLineGlobStr->getValueType(),
+                /*Ptr*/FileAndLineGlobStr,
+                /*IdxList*/{idx_zero, idx_zero}
+            );
+
+            // extract other operands of __builtin_uli_lazyd_inst
             Value *TripCount = CI->getArgOperand(2);
             Value *GranSize = CI->getArgOperand(3);
             Value *Depth = CI->getArgOperand(4);
-            assert(FileAndLineNumber 
+            assert(LinkageName 
+                && FileAndLine
                 && TripCount 
                 && GranSize 
                 && Depth 
                 && "__builtin_uli_lazyd_inst has null argument!");
             
+            // call void %0(i8* file_and_line_number, i64 trip_count, i64 grain_size, i32 depth)
             builder.CreateCall(
                 /*FTy*/FnTy, 
                 /*Callee*/Callee,
-                /*Args*/{FileAndLineNumber, TripCount, GranSize, Depth}
+                /*Args*/{LinkageName, FileAndLine, TripCount, GranSize, Depth}
             );
-            outs() << "  call to lazydIntrumentLoop np!\n";
+            // outs() << "  call to lazydIntrumentLoop np!\n";
             // delete original intrinsic later
             Builtin_Uli_Lazyd_Insts.push_back(&*I);
             Changed = true;
         }
     }
-    outs() << '\n';
     // delete replaced intrinsics
     for (auto *I : Builtin_Uli_Lazyd_Insts) {
         I->eraseFromParent();
     }
-    outs() << "erased all __builtin_uli_lazyd_inst!" << "\n";
+    // outs() << "erased all __builtin_uli_lazyd_inst in " << F.getName() << "!\n";
     return Changed;
 }
 
 struct BuiltInInstrumentPass : public PassInfoMixin<BuiltInInstrumentPass> {
     PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM) {
-        outs() << "<><><><> at least BuiltInInstrumentPass is run! <><><><>\n";
+        // outs() << "<><><><> at least BuiltInInstrumentPass is run! <><><><>\n";
         SmallVector<Function *, 8> WorkList;
         for (Function &F : M) {
             if (!F.empty() && !F.isDeclaration())
@@ -144,7 +184,7 @@ struct BuiltInInstrumentPass : public PassInfoMixin<BuiltInInstrumentPass> {
 
 PassPluginLibraryInfo getPassPluginInfo() {
     const auto callback = [](PassBuilder &PB) {
-        PB.registerTapirLateEPCallback([&](ModulePassManager &MPM, auto) {
+        PB.registerTapirLoopEndEPCallback([&](ModulePassManager &MPM, auto) {
             MPM.addPass(BuiltInInstrumentPass());
             return true;
         });

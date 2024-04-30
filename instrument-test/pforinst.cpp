@@ -2,25 +2,38 @@
 #include<map>
 #include<unordered_map>
 #include<vector>
+#include <fstream>
 #include<iostream>
 
-std::unordered_map<std::string, std::vector<std::tuple<size_t, long, int>>> pfor_metadata;
+std::unordered_map<std::string, std::vector<std::tuple<std::string, size_t, long, int>>> pfor_metadata;
 
 extern "C" {
+
+bool instrumentTimeLoopOnly = false;
 __attribute__((used))
-void lazydIntrumentLoop (const char *filename_and_line, size_t tripcount, long grainsize, int depth){
+void lazydIntrumentLoop (const char *linkage_name, const char *filename_and_line, size_t tripcount, long grainsize, int depth){
+    if (!instrumentTimeLoopOnly) 
+        return;
     std::string FilenameAndLine(filename_and_line);
-    pfor_metadata[FilenameAndLine].push_back(std::make_tuple(tripcount, grainsize, depth));
+    std::string LinkageName(linkage_name);
+    pfor_metadata[LinkageName].push_back(std::make_tuple(FilenameAndLine, tripcount, grainsize, depth));
 }
 
 __attribute__((used))
 __attribute__((destructor))
 void lazydIntrumentLoopDump () {
+    std::ofstream fout("pforinst.csv");
+    if (!fout.is_open()) {
+        std::cerr << "failed to open pforinst.csv!" << std::endl;
+        return;
+    }
+
+    fout << "LinkageName,FileAndLineNumber,tripcount,grainsize,depth" << std::endl;
     for (auto &elem : pfor_metadata) {
         for (auto &value : elem.second) {
-            size_t tripcount; long grainsize; int depth;
-            std::tie(tripcount, grainsize, depth)= value;
-            std::cout << "FileAndLineNumber," << elem.first << ",tripcount," << tripcount << ",grainsize," << grainsize << ",depth," << depth << "\n";
+            std::string filename_n_line; size_t tripcount; long grainsize; int depth;
+            std::tie(filename_n_line, tripcount, grainsize, depth) = value;
+            fout << elem.first << "," << filename_n_line << "," << tripcount << "," << grainsize << "," << depth << std::endl;
         }
     }
 }

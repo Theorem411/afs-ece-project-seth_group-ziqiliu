@@ -2,7 +2,7 @@ all: instrument-pass.so libInstrument.so libBuiltinIntrinsic.so libPforinst.so
 
 CXX = /afs/ece/project/seth_group/ziqiliu/GCC-12.2.0/bin/g++-12.2.0
 
-CXXFLAGS = -rdynamic $(shell llvm-config --cxxflags) -g -O0 -fPIC
+CXXFLAGS = -rdynamic $(shell llvm-config --cxxflags) -gdwarf-2 -O0 -fPIC
 
 instrument-lib.o: instrument-lib.cpp
 	$(CXX) $(CXXFLAGS) -c $^ -o $@

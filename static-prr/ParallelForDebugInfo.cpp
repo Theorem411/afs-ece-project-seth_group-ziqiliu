@@ -1,6 +1,8 @@
-/*****************************************************************************/
-// print out source-level debug info for parallel_for template functions calls in pbbs_v2 
-/*****************************************************************************/
+/*****************************************************************************
+* ParallelForDebugInfo pass: This pass contains three functionality
+* 1) output .dbg.csv file containing ParallelRegion analysis state results 
+* 2) print/write to file the source code location of each cilk_for
+*****************************************************************************/
 #include "llvm/Pass.h"
 #include "llvm/PassInfo.h"
 #include "llvm/PassRegistry.h"
@@ -66,23 +68,24 @@ private:
 
 //============ CSV output helper class =====================================
 struct CsvRow {
-    CsvRow(Function &Func, PRState prs, StringRef SpName, StringRef TempFile) : 
-        Func(Func), prs(prs), SpName(SpName), TempFile(TempFile) {}
+    CsvRow(Function &F, PRState prs, StringRef SpName, StringRef TempFile, StringRef LinkageName) : 
+        F(F), prs(prs), SpName(SpName), TempFile(TempFile), LinkageName(LinkageName) {}
     // CsvRow(std::string FuncName, std::string FileName, std::string DirName, std::string ln, std::string prs) 
     //     : FuncName(FuncName), FileName(FileName), DirName(DirName), ln(ln), prs(prs) {}
 
     // emit a row of csv output
     std::string emit() const {
         return printPRState(prs).str() + "," 
-            + SpName.str() + ","
-            + TempFile.str() + "," 
-            + Func.getName().str() + "\n";
+            + '\"' + SpName.str() + '\"' + ","
+            + LinkageName.str() + "," 
+            + TempFile.str() + "\n";
     }
 private: 
-    Function &Func;
+    Function &F;
     PRState prs;
     StringRef SpName;
     StringRef TempFile;
+    StringRef LinkageName;
 };
 
 struct CSV {
@@ -93,7 +96,7 @@ public:
         rows.push_back(row);
     }
     std::string emitHeader() const {
-        return "prs,sp_name,temp_file,pfor\n";
+        return "prs,sp_name,linkage_name,temp_file\n";
     }
 public: 
     SmallVector<CsvRow, 8> rows;
@@ -110,37 +113,27 @@ struct ParallelForDebugInfoImpl {
     }
     void run();
 private:
-    // Parallel_for name parsing "parallel_for<(lambda at ...": modify filename, ln, col
-    ParallelFor *getParallelForMetadata(Function &F, DISubprogram *SP);
-
+    void runOnFunction(Function &F, std::function<LoopInfo &(Function &)> getLI, 
+                        std::function<TaskInfo &(Function &)> getTI);
     // I/O utility
     void flushCSV() const;
 private:  
     Module &M;
     const ParallelRegion &PR;
+    
+
+
+
     // record all parallel_for spec
     DenseMap<Function *, ParallelFor *> ParallelForMap;
     // final csv output representation
     CSV csv;
 };
 
-ParallelFor *ParallelForDebugInfoImpl::getParallelForMetadata(Function &F, DISubprogram *SP) {
-    // mdnode field: name
-    StringRef spname = SP->getName();
-
-    if(!spname.startswith(StringRef("parallel_for<(lambda at "))) 
-        return nullptr;
-    // mdnode field: file (template file)
-    DIFile *DIF = SP->getFile();
-    assert(DIF && "DIF empty!");
-    StringRef tempfile = DIF->getFilename();
-    // errs() << F.getName() << "\n" << "  " << tempfile << "\n";
-    
-    ParallelFor *pfor = new ParallelFor(F, PR[&F], spname, tempfile); 
-    return pfor;
-}
-
-void ParallelForDebugInfoImpl::run() {
+void ParallelForDebugInfoImpl::run(
+        std::function<LoopInfo &(Function &)> getLI, 
+        std::function<TaskInfo &(Function &)> getTI) {
+    /******************** Output .dbg.csv file ******************************/
     //=== Find all parallel_for specification declaration ===========
     for (Function &F : M) {
         if (F.isDeclaration()) 
@@ -149,51 +142,87 @@ void ParallelForDebugInfoImpl::run() {
         DISubprogram *SP = F.getSubprogram();
         if (!SP)
             continue;
+        // mdnode field: file (template file)
+        DIFile *DIF = SP->getFile();
+        assert(DIF && "DIF empty!");
+        StringRef tempfile = DIF->getFilename();
+        
+        // mdnode field: linkage name
+        StringRef linkname = SP->getLinkageName();
+        // get parallel_for spec function prstate
+        PRState prs = PR[&F];
 
-        if (ParallelFor *PFor = getParallelForMetadata(F, SP)) {
-            // found parallel_for!
-
-            // get parallel_for spec function prstate
-            PRState prs = PR[&F];
-
-            // record PFor
-            ParallelForMap[&F] = PFor;
-
-            // // append parallel for info to csv
-            CsvRow csvr(PFor->getFunction(), PFor->getPRS(), PFor->getSpName(), PFor->getTemplateFile());
-            csv.add(csvr);
-        }
+        // // append parallel for info to csv
+        CsvRow row(F, prs, SP->getName(), tempfile, linkname);
+        csv.add(row);
     }
-
-    //=== Find all parallel_for spec callsite
-    for (Function &F : M) {
-        for (auto I = inst_begin(F), E = inst_end(F); I != E; ++I) {
-            Function *PforFunc = nullptr; 
-            if (auto *CI = dyn_cast<CallInst>(&*I)) {
-                PforFunc = CI->getCalledFunction();
-            } else if (auto *VI = dyn_cast<InvokeInst>(&*I)) {
-                PforFunc = VI->getCalledFunction();
-            }
-            // not callinst or invokeinst
-            if (!PforFunc)
-                continue;
-            // must be parallel_for 
-            if (ParallelForMap.find(PforFunc) == ParallelForMap.end()) 
-                continue;
-            ParallelFor *PFor = ParallelForMap[PforFunc];
-
-            // get block PRState
-            BasicBlock *B = I->getParent();
-            PRState prs = PR[B];
-            if (prs != PFor->getPRS()) {
-                // errs() << "parallel_for spec has inconsistent prs: " << PFor->getFuncName(); 
-                // errs() << "\n  Block: " << printPRState(prs) << "   Func: " << printPRState(PFor->getPRS()) << "\n";
-            }
-        }
-    }
-
+    
     // flush result to a csv
     flushCSV();
+
+    /*********** Output cilk_for source-level information *******************/
+    for (Function &F : M) {
+        if (F.isDeclaration()) 
+            continue;
+        runOnFunction(F, getLI, getTI);
+    }
+}
+
+/**
+ * For each cilk_for, print out the DebugLoc of the first instruction 
+*/
+void ParallelForDebugInfoImpl::runOnFunction(
+        Function &F, 
+        std::function<LoopInfo &(Function &)> getLI, 
+        std::function<TaskInfo &(Function &)> getTI) {
+    TaskInfo &TI = getTI(F);
+    LoopInfo &LI = getLI(F);
+    if (TI.isSerial()) {
+        continue;
+    }
+    for (Loop *TopLoop : LI) {
+        for (Loop *L : post_order(TopLoop)) {
+            if (Task *T = llvm::getTaskIfTapirLoopStructure(L, &TI)) {
+                /* print out 
+                 * 1) original llvm instruction 
+                 * 2) if there are inlineAt info, print out source code loc
+                 * 3) the final source code level location
+                 */
+                Instruction *LoopInstr = L->getHeader()->getFirstNonPHIOrDbg();
+                std::string s;
+                {
+                    raw_string_ostream ros(s);
+                    LoopInstr->print(ros);
+                    ros.flush();
+                }
+                LLVM_DEBUG(dbgs() << "cilk_for first instr:\n" << StringRef(s) << '\n');
+                const DebugLoc &DLoc = LoopInstr->getDebugLoc(); 
+                if (!DLoc || !DLoc.get()) {
+                    LLVM_DEBUG(dbgs() << "\tno valid DILocation info!\n");
+                    continue;
+                }
+                // print DebugLoc of instruction
+                DILocation *DIL = DLoc.get(); 
+                do {
+                    unsigned ln = DIL->getLine();
+                    unsigned col = DIL->getColumn(); 
+                    DIScope *DIS = DIL->getScope(); 
+                    std::string file = (DIS) ? DIS->getFilename().str() : "invalid filename";
+
+                    LLVM_DEBUG(dbgs() << "!DILocation: " << file << ":" << ln << ":" << col);
+                    if (DISubprogram *DIP = dyn_cast<DISubprogram>(DIS)) {
+                        LLVM_DEBUG(dbgs() << "\tsubprogram: " << DIP->getName()); 
+                    }
+                    DILocation *DILInlinedAt = DIL->getInlinedAt();
+                    if (DILInlinedAt) {
+                        LLVM_DEBUG(dbgs() << "\n\t\t\tinlined at: "); 
+                    }
+                    DIL = DILInlinedAt;
+
+                } while (DIL);
+            }
+        }
+    }
 }
 
 void ParallelForDebugInfoImpl::flushCSV() const {
@@ -220,8 +249,15 @@ struct ParallelForDebugInfo : public PassInfoMixin<ParallelForDebugInfo> {
     explicit ParallelForDebugInfo() {};
 
     PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM) {
+        auto &FAM = AM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
+        auto getLI = [&](Function &F) -> LoopInfo& {
+            return FAM.getResult<LoopAnalysis>(F);
+        };
+        auto getTI = [&](Function &F) -> TaskInfo& {
+            return FAM.getResult<TaskAnalysis>(F);
+        };
         const ParallelRegion &PR = AM.getResult<ParallelRegionAnalysis>(M);
-        ParallelForDebugInfoImpl(M, PR).run();
+        ParallelForDebugInfoImpl(M, PR).run(getLI, getTI);
         return PreservedAnalyses::all();
     }
 };
@@ -241,6 +277,12 @@ PassPluginLibraryInfo getParallelRegionStatsPluginInfo() {
                 return false;
             }
         );
+        // the same pipeline extension point as instrumentation pass
+        PB.registerTapirLateEPCallback([&](ModulePassManager &MPM, auto) {
+            MPM.addPass(ParallelForDebugInfo());
+            return true;
+        });
+
     };
 
     return {LLVM_PLUGIN_API_VERSION, PBBSV2_NAME, "0.0.1", callback};
